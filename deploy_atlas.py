@@ -1921,6 +1921,503 @@ if __name__ == "__main__":
     main()
 '''
 
+REBUILD_PY = r'''#!/usr/bin/env python3
+"""
+Atlas rebuild - Refresh the codebase index in-place.
+
+Rebuilds all index files from the current source tree without
+re-deploying the tool scripts.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Set, Tuple
+
+from tool_common import (
+    ensure_dir,
+    find_atlas_root,
+    json_dump,
+    load_index_state,
+    normalize_rel_path,
+    parse_toon_list,
+    print_kv,
+    print_section,
+    toon_esc,
+    toon_header,
+    toon_list,
+)
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+DEFAULT_EXTENSIONS = [
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".tpp", ".tcc",
+    ".py", ".pyi", ".pyw",
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".java", ".kt", ".kts", ".go", ".rs", ".rb", ".erb", ".php",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".ini", ".cfg",
+    ".md", ".rst", ".txt", ".sql",
+    ".swift", ".m", ".mm", ".scala", ".clj", ".lua", ".r", ".R",
+    "Makefile", "CMakeLists.txt", "BUILD", "BUILD.bazel", "WORKSPACE",
+    "Dockerfile", "docker-compose.yml", "package.json", "Cargo.toml",
+    "pyproject.toml", "setup.py", "requirements.txt", "go.mod", "go.sum",
+]
+
+DEFAULT_SKIP_DIRS = [
+    ".git", ".svn", ".hg", ".bzr",
+    "node_modules", "vendor", "venv", ".venv", "env", ".env",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".tox",
+    "build", "dist", "target", "out", "bin", "obj",
+    ".idea", ".vscode", ".vs",
+    "coverage", ".coverage", "htmlcov",
+    ".next", ".nuxt", ".output",
+    "atlas",
+]
+
+DEFAULT_SKIP_GLOBS = [
+    "*.min.js", "*.min.css", "*.map",
+    "*.pyc", "*.pyo", "*.class", "*.o", "*.obj", "*.a", "*.so", "*.dylib", "*.dll",
+    "*.exe", "*.bin", "*.dat", "*.db", "*.sqlite", "*.sqlite3",
+    "*.log", "*.lock", "package-lock.json", "yarn.lock", "Cargo.lock",
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.svg", "*.webp",
+    "*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx", "*.ppt", "*.pptx",
+    "*.zip", "*.tar", "*.gz", "*.rar", "*.7z",
+    "*.woff", "*.woff2", "*.ttf", "*.eot",
+    ".DS_Store", "Thumbs.db",
+]
+
+RESERVED_TRANSLOG_DIRS = {"__history__", "__diffs__", "__meta__"}
+
+
+# =============================================================================
+# PATTERNS
+# =============================================================================
+
+PATTERNS = {
+    "class": re.compile(r"^\s*(?:export\s+)?(?:abstract\s+)?class\s+(\w+)", re.MULTILINE),
+    "struct": re.compile(r"^\s*(?:typedef\s+)?struct\s+(\w+)", re.MULTILINE),
+    "interface": re.compile(r"^\s*(?:export\s+)?interface\s+(\w+)", re.MULTILINE),
+    "enum": re.compile(r"^\s*(?:export\s+)?enum\s+(\w+)", re.MULTILINE),
+    "function_def": re.compile(r"^\s*(?:async\s+)?(?:export\s+)?(?:default\s+)?function\s+(\w+)", re.MULTILINE),
+    "arrow_func": re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>", re.MULTILINE),
+    "c_function": re.compile(r"^(?!.*\b(?:if|while|for|switch|return|else)\b)\s*(?:static\s+)?(?:inline\s+)?(?:const\s+)?(?:\w+[\s*&]+)+(\w+)\s*\([^;]*\)\s*\{", re.MULTILINE),
+    "python_def": re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", re.MULTILINE),
+    "python_class": re.compile(r"^\s*class\s+(\w+)\s*[:\(]", re.MULTILINE),
+    "import_from": re.compile(r"^\s*(?:from\s+([^\s]+)\s+)?import\s+", re.MULTILINE),
+    "import_require": re.compile(r"(?:require|import)\s*\(\s*['\"]([^'\"]+)['\"]", re.MULTILINE),
+    "cpp_include": re.compile(r'^\s*#include\s*[<"]([^>"]+)[>"]', re.MULTILINE),
+    "es_import": re.compile(r"^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]", re.MULTILINE),
+    "const_def": re.compile(r"^\s*(?:export\s+)?const\s+([A-Z][A-Z0-9_]*)\s*=", re.MULTILINE),
+    "define": re.compile(r"^\s*#define\s+([A-Z][A-Z0-9_]*)", re.MULTILINE),
+    "todo": re.compile(r"(?://|#|/\*)\s*(TODO|FIXME|HACK|XXX|BUG|NOTE)[\s:]+(.{0,100})", re.IGNORECASE),
+    "security": re.compile(r"(password|secret|api[_-]?key|token|credential|auth|private[_-]?key)\s*[:=]", re.IGNORECASE),
+}
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def walk_project_files(root: str, extensions: Iterable[str], skip_dirs: Iterable[str], skip_globs: Iterable[str]) -> List[str]:
+    exts = {e.lower() for e in extensions}
+    skip_dir_set = set(skip_dirs or [])
+    skip_glob_list = list(skip_globs or [])
+    results = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        filtered_dirs = []
+        for d in dirnames:
+            if d in skip_dir_set or d in RESERVED_TRANSLOG_DIRS or d.startswith("."):
+                continue
+            filtered_dirs.append(d)
+        dirnames[:] = filtered_dirs
+        for fn in filenames:
+            if any(fnmatch.fnmatch(fn, pat) for pat in skip_glob_list):
+                continue
+            fp = os.path.join(dirpath, fn)
+            suffix = Path(fn).suffix.lower()
+            if suffix in exts or fn in exts:
+                results.append(fp)
+    results.sort()
+    return results
+
+
+def extract_symbols(content: str, file_path: str) -> Dict[str, Any]:
+    ext = Path(file_path).suffix.lower()
+    symbols = {"classes": [], "functions": [], "imports": [], "constants": [], "todos": [], "security_hints": []}
+    
+    for m in PATTERNS["class"].finditer(content):
+        symbols["classes"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1, "type": "class"})
+    for m in PATTERNS["struct"].finditer(content):
+        symbols["classes"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1, "type": "struct"})
+    for m in PATTERNS["interface"].finditer(content):
+        symbols["classes"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1, "type": "interface"})
+    for m in PATTERNS["enum"].finditer(content):
+        symbols["classes"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1, "type": "enum"})
+    for m in PATTERNS["python_class"].finditer(content):
+        symbols["classes"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1, "type": "class"})
+    
+    for m in PATTERNS["function_def"].finditer(content):
+        symbols["functions"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    for m in PATTERNS["arrow_func"].finditer(content):
+        symbols["functions"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    for m in PATTERNS["python_def"].finditer(content):
+        symbols["functions"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    if ext in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"):
+        for m in PATTERNS["c_function"].finditer(content):
+            symbols["functions"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    
+    for m in PATTERNS["cpp_include"].finditer(content):
+        symbols["imports"].append({"target": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    for m in PATTERNS["es_import"].finditer(content):
+        symbols["imports"].append({"target": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    for m in PATTERNS["import_from"].finditer(content):
+        if m.group(1):
+            symbols["imports"].append({"target": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    for m in PATTERNS["import_require"].finditer(content):
+        symbols["imports"].append({"target": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    
+    for m in PATTERNS["const_def"].finditer(content):
+        symbols["constants"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    for m in PATTERNS["define"].finditer(content):
+        symbols["constants"].append({"name": m.group(1), "line": content[:m.start()].count("\n") + 1})
+    
+    for m in PATTERNS["todo"].finditer(content):
+        symbols["todos"].append({"type": m.group(1).upper(), "text": m.group(2).strip(), "line": content[:m.start()].count("\n") + 1})
+    
+    for m in PATTERNS["security"].finditer(content):
+        symbols["security_hints"].append({"match": m.group(0)[:50], "line": content[:m.start()].count("\n") + 1})
+    
+    return symbols
+
+
+def detect_probable_calls(content: str, known_functions: Set[str], max_functions: int = 500) -> List[str]:
+    if not known_functions:
+        return []
+    func_list = list(known_functions)[:max_functions]
+    calls = set()
+    batch_size = 100
+    for i in range(0, len(func_list), batch_size):
+        batch = func_list[i:i + batch_size]
+        pattern_str = r"\b(" + "|".join(re.escape(f) for f in batch) + r")\s*\("
+        try:
+            pattern = re.compile(pattern_str)
+            for m in pattern.finditer(content):
+                calls.add(m.group(1))
+        except re.error:
+            pass
+    return list(calls)
+
+
+def write_toon_file(path: str, record_type: str, version: int, fields: List[str], rows: List[Dict[str, Any]], comments: List[str] = None) -> None:
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(toon_header(record_type, version, fields) + "\n")
+        if comments:
+            for c in comments:
+                fh.write(c + "\n")
+        for row in rows:
+            values = [toon_esc(row.get(f, "")) for f in fields]
+            fh.write("|".join(values) + "\n")
+
+
+# =============================================================================
+# REBUILDER
+# =============================================================================
+
+def rebuild_index(atlas_root: str, skip_callgraph: bool = False, update_translog: bool = False, verbose: bool = False) -> Dict[str, Any]:
+    state = load_index_state(atlas_root)
+    project_root = state.get("project_root")
+    
+    if not project_root or not os.path.isdir(project_root):
+        print(f"Error: Project root not found: {project_root}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Load config
+    config_path = os.path.join(atlas_root, "cache", "config_effective.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    else:
+        config = {"extensions": DEFAULT_EXTENSIONS, "skip_dirs": DEFAULT_SKIP_DIRS, "skip_globs": DEFAULT_SKIP_GLOBS}
+    
+    exts = config.get("extensions", DEFAULT_EXTENSIONS)
+    skip_dirs = config.get("skip_dirs", DEFAULT_SKIP_DIRS)
+    skip_globs = config.get("skip_globs", DEFAULT_SKIP_GLOBS)
+    
+    index_dir = os.path.join(atlas_root, "index")
+    cache_dir = os.path.join(atlas_root, "cache")
+    
+    # Scan files
+    print_section("Scanning Files")
+    print("  Scanning directory tree...", flush=True)
+    file_paths = walk_project_files(project_root, exts, skip_dirs, skip_globs)
+    
+    files = []
+    for fp in file_paths:
+        rel = normalize_rel_path(os.path.relpath(fp, project_root))
+        try:
+            stat_info = os.stat(fp)
+            files.append({"path": rel, "abs_path": fp, "size": stat_info.st_size, "ext": Path(fp).suffix.lower()})
+        except OSError:
+            continue
+    print(f"  Found {len(files)} files to index")
+    
+    # Extract symbols
+    print_section("Extracting Symbols")
+    symbols = defaultdict(list)
+    imports_map = defaultdict(list)
+    importers_map = defaultdict(list)
+    all_functions = set()
+    call_graph = defaultdict(list)
+    todos = []
+    security_hints = []
+    constants = defaultdict(list)
+    
+    total = len(files)
+    last_report = 0
+    
+    for idx, f in enumerate(files):
+        progress = idx + 1
+        if progress == total or progress - last_report >= 200 or (total > 100 and progress % max(1, total // 10) == 0):
+            print(f"  Processed {progress}/{total} files...", flush=True)
+            last_report = progress
+        
+        try:
+            content = read_text(f["abs_path"])
+            syms = extract_symbols(content, f["path"])
+            
+            f["line_count"] = content.count("\n") + 1
+            f["classes"] = [c["name"] for c in syms["classes"]]
+            f["functions"] = [fn["name"] for fn in syms["functions"]]
+            f["import_count"] = len(syms["imports"])
+            
+            for cls in syms["classes"]:
+                cls["file"] = f["path"]
+                symbols["classes"].append(cls)
+            
+            for func in syms["functions"]:
+                func["file"] = f["path"]
+                symbols["functions"].append(func)
+                all_functions.add(func["name"])
+            
+            for imp in syms["imports"]:
+                imports_map[f["path"]].append(imp["target"])
+                importers_map[imp["target"]].append(f["path"])
+            
+            for const in syms["constants"]:
+                const["file"] = f["path"]
+                constants[const["name"]].append(const)
+            
+            for todo in syms["todos"]:
+                todo["file"] = f["path"]
+                todos.append(todo)
+            
+            for sec in syms["security_hints"]:
+                sec["file"] = f["path"]
+                security_hints.append(sec)
+                
+        except Exception as e:
+            if verbose:
+                print(f"  Warning: Failed to process {f['path']}: {e}")
+    
+    # Build call graph
+    if skip_callgraph:
+        print_section("Skipping Call Graph (--skip-callgraph)")
+    else:
+        print_section("Building Call Graph")
+        if all_functions:
+            func_count = len(all_functions)
+            print(f"  Analyzing calls for {func_count} known functions...")
+            if func_count > 500:
+                print(f"  Note: Limiting to 500 functions for performance")
+            
+            last_report = 0
+            for idx, f in enumerate(files):
+                progress = idx + 1
+                if progress == total or progress - last_report >= 200 or (total > 100 and progress % max(1, total // 10) == 0):
+                    print(f"  Analyzed {progress}/{total} files...", flush=True)
+                    last_report = progress
+                
+                try:
+                    content = read_text(f["abs_path"])
+                    calls = detect_probable_calls(content, all_functions)
+                    if calls:
+                        call_graph[f["path"]] = calls
+                except Exception:
+                    continue
+    
+    # Write index files
+    print_section("Writing Index Files")
+    
+    # Files
+    file_fields = ["path", "size", "line_count", "ext", "classes", "functions", "import_count"]
+    file_rows = [{"path": f["path"], "size": str(f.get("size", 0)), "line_count": str(f.get("line_count", 0)),
+                  "ext": f.get("ext", ""), "classes": toon_list(f.get("classes", [])),
+                  "functions": toon_list(f.get("functions", [])), "import_count": str(f.get("import_count", 0))}
+                 for f in files]
+    write_toon_file(os.path.join(index_dir, "files.toon"), "file_inventory", 1, file_fields, file_rows)
+    
+    # Classes
+    class_fields = ["name", "type", "file", "line"]
+    class_rows = [{"name": c["name"], "type": c.get("type", "class"), "file": c["file"], "line": str(c["line"])}
+                  for c in symbols["classes"]]
+    write_toon_file(os.path.join(index_dir, "classes.toon"), "class_index", 1, class_fields, class_rows)
+    
+    # Functions
+    func_fields = ["name", "file", "line"]
+    func_rows = [{"name": fn["name"], "file": fn["file"], "line": str(fn["line"])} for fn in symbols["functions"]]
+    write_toon_file(os.path.join(index_dir, "functions.toon"), "function_index", 1, func_fields, func_rows)
+    
+    # Imports
+    import_fields = ["file", "imports"]
+    import_rows = [{"file": f, "imports": toon_list(imps)} for f, imps in sorted(imports_map.items())]
+    write_toon_file(os.path.join(index_dir, "imports.toon"), "import_map", 1, import_fields, import_rows)
+    
+    # Importers
+    importer_fields = ["target", "importers"]
+    importer_rows = [{"target": t, "importers": toon_list(imps)} for t, imps in sorted(importers_map.items())]
+    write_toon_file(os.path.join(index_dir, "importers.toon"), "importer_map", 1, importer_fields, importer_rows)
+    
+    # Calls
+    call_fields = ["file", "calls"]
+    call_rows = [{"file": f, "calls": toon_list(calls)} for f, calls in sorted(call_graph.items())]
+    write_toon_file(os.path.join(index_dir, "calls.toon"), "call_graph", 1, call_fields, call_rows)
+    
+    # TODOs
+    todo_fields = ["file", "line", "type", "text"]
+    todo_rows = [{"file": t["file"], "line": str(t["line"]), "type": t["type"], "text": t["text"]} for t in todos]
+    write_toon_file(os.path.join(index_dir, "todos.toon"), "todo_index", 1, todo_fields, todo_rows)
+    
+    # Security
+    sec_fields = ["file", "line", "match"]
+    sec_rows = [{"file": s["file"], "line": str(s["line"]), "match": s["match"]} for s in security_hints]
+    write_toon_file(os.path.join(index_dir, "security.toon"), "security_hints", 1, sec_fields, sec_rows)
+    
+    # Constants
+    const_fields = ["name", "file", "line"]
+    const_rows = []
+    for name, locs in sorted(constants.items()):
+        for loc in locs:
+            const_rows.append({"name": name, "file": loc["file"], "line": str(loc["line"])})
+    write_toon_file(os.path.join(index_dir, "constants.toon"), "constant_index", 1, const_fields, const_rows)
+    
+    # Structure
+    dir_tree = defaultdict(list)
+    for f in files:
+        parent = os.path.dirname(f["path"]) or "."
+        dir_tree[parent].append(os.path.basename(f["path"]))
+    struct_fields = ["directory", "files"]
+    struct_rows = [{"directory": d, "files": toon_list(fls)} for d, fls in sorted(dir_tree.items())]
+    write_toon_file(os.path.join(index_dir, "structure.toon"), "directory_structure", 1, struct_fields, struct_rows)
+    
+    # Update cache
+    print_section("Updating Cache")
+    
+    func_lookup = defaultdict(list)
+    for fn in symbols["functions"]:
+        func_lookup[fn["name"]].append({"file": fn["file"], "line": fn["line"]})
+    with open(os.path.join(cache_dir, "function_lookup.json"), "w") as fh:
+        json.dump(func_lookup, fh)
+    
+    class_lookup = defaultdict(list)
+    for cls in symbols["classes"]:
+        class_lookup[cls["name"]].append({"file": cls["file"], "line": cls["line"], "type": cls.get("type", "class")})
+    with open(os.path.join(cache_dir, "class_lookup.json"), "w") as fh:
+        json.dump(class_lookup, fh)
+    
+    with open(os.path.join(cache_dir, "index_state.json"), "w") as fh:
+        json.dump({
+            "project_root": project_root,
+            "atlas_root": atlas_root,
+            "indexed_at": utc_now(),
+            "file_count": len(files),
+            "function_count": len(symbols["functions"]),
+            "class_count": len(symbols["classes"]),
+        }, fh, indent=2)
+    
+    # Update translog if requested
+    if update_translog:
+        print_section("Updating Translog Baseline")
+        translog_dir = os.path.join(atlas_root, "translog")
+        tracked = 0
+        for f in files:
+            dst = os.path.join(translog_dir, f["path"].replace("/", os.sep))
+            ensure_dir(os.path.dirname(dst))
+            try:
+                shutil.copy2(f["abs_path"], dst)
+                tracked += 1
+            except Exception:
+                pass
+        print(f"  Updated {tracked} file baselines")
+    
+    summary = {
+        "files": len(files),
+        "classes": len(symbols["classes"]),
+        "functions": len(symbols["functions"]),
+        "imports": sum(len(v) for v in imports_map.values()),
+        "todos": len(todos),
+        "security_hints": len(security_hints),
+    }
+    
+    return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Rebuild the Atlas codebase index")
+    parser.add_argument("--atlas", help="Path to atlas directory")
+    parser.add_argument("--skip-callgraph", action="store_true", help="Skip call graph analysis (faster)")
+    parser.add_argument("--update-translog", action="store_true", help="Also update translog baseline")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    ns = parser.parse_args()
+    
+    atlas_root = find_atlas_root(ns.atlas)
+    summary = rebuild_index(atlas_root, skip_callgraph=ns.skip_callgraph, 
+                           update_translog=ns.update_translog, verbose=ns.verbose)
+    
+    print_section("Rebuild Complete")
+    
+    if ns.json:
+        print(json_dump(summary))
+    else:
+        print(f"""
+Summary:
+  Files indexed:     {summary['files']}
+  Classes found:     {summary['classes']}
+  Functions found:   {summary['functions']}
+  Import edges:      {summary['imports']}
+  TODOs found:       {summary['todos']}
+  Security hints:    {summary['security_hints']}
+""")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
 ATLAS_CLI_PY = r'''#!/usr/bin/env python3
 """
 Atlas CLI - Command router for the Atlas codebase index.
@@ -1959,9 +2456,15 @@ Atlas - Codebase Index for LLM Coding Assistants
 
 Usage:
     atlas query <command> [args...]     Query the codebase index
+    atlas rebuild [options]             Rebuild the index from current source
     atlas translog [--poll]             Snapshot or poll for file changes
     atlas translog-report <file>        Show change history for a file
     atlas help                          Show this help message
+
+Rebuild Options:
+    atlas rebuild                       Full rebuild including call graph
+    atlas rebuild --skip-callgraph      Faster rebuild without call graph
+    atlas rebuild --update-translog     Also refresh translog baseline
 
 Query Commands:
     atlas query summary                 Show index summary
@@ -1987,6 +2490,7 @@ Query Commands:
 Examples:
     atlas query search socket
     atlas query impact-file src/core/engine.h
+    atlas rebuild --skip-callgraph
     atlas translog --poll
     atlas translog-report src/main.cpp
 """)
@@ -2006,6 +2510,9 @@ def main():
     
     if command == "query":
         sys.exit(run_tool("query", args))
+    
+    if command == "rebuild":
+        sys.exit(run_tool("rebuild", args))
     
     if command == "translog":
         sys.exit(run_tool("translog", args))
@@ -2042,10 +2549,10 @@ At the beginning of any coding session:
 
 ```bash
 # Get index overview
-python atlas/bin/atlas_cli.py query summary
+python atlas/bin/atlas.py query summary
 
 # See available commands
-python atlas/bin/atlas_cli.py query capabilities
+python atlas/bin/atlas.py query capabilities
 ```
 
 ---
@@ -2064,59 +2571,59 @@ python atlas/bin/atlas_cli.py query capabilities
 
 ### Summary & Diagnostics
 ```bash
-python atlas/bin/atlas_cli.py query summary          # Index overview
-python atlas/bin/atlas_cli.py query capabilities     # Available commands
-python atlas/bin/atlas_cli.py query doctor           # Check index health
+python atlas/bin/atlas.py query summary          # Index overview
+python atlas/bin/atlas.py query capabilities     # Available commands
+python atlas/bin/atlas.py query doctor           # Check index health
 ```
 
 ### Finding Code
 ```bash
-python atlas/bin/atlas_cli.py query search <term>              # Search everywhere
-python atlas/bin/atlas_cli.py query search <term> --regex      # Regex search
-python atlas/bin/atlas_cli.py query search <term> --path src/  # Filter by path
-python atlas/bin/atlas_cli.py query structure <path>           # Directory listing
+python atlas/bin/atlas.py query search <term>              # Search everywhere
+python atlas/bin/atlas.py query search <term> --regex      # Regex search
+python atlas/bin/atlas.py query search <term> --path src/  # Filter by path
+python atlas/bin/atlas.py query structure <path>           # Directory listing
 ```
 
 ### Symbol Lookup
 ```bash
-python atlas/bin/atlas_cli.py query class <ClassName>     # Find class definitions
-python atlas/bin/atlas_cli.py query func <FunctionName>   # Find function definitions
-python atlas/bin/atlas_cli.py query symbol <Name>         # Find any symbol
-python atlas/bin/atlas_cli.py query constants <NAME>      # Find constants/defines
+python atlas/bin/atlas.py query class <ClassName>     # Find class definitions
+python atlas/bin/atlas.py query func <FunctionName>   # Find function definitions
+python atlas/bin/atlas.py query symbol <Name>         # Find any symbol
+python atlas/bin/atlas.py query constants <NAME>      # Find constants/defines
 ```
 
 ### Dependency Analysis
 ```bash
-python atlas/bin/atlas_cli.py query imports <file>        # What does this file import?
-python atlas/bin/atlas_cli.py query importers <target>    # What imports this target?
-python atlas/bin/atlas_cli.py query related <file>        # Both directions
+python atlas/bin/atlas.py query imports <file>        # What does this file import?
+python atlas/bin/atlas.py query importers <target>    # What imports this target?
+python atlas/bin/atlas.py query related <file>        # Both directions
 ```
 
 ### Call Graph (Heuristic)
 ```bash
-python atlas/bin/atlas_cli.py query calls <file>          # Probable calls from file
-python atlas/bin/atlas_cli.py query callers <symbol>      # Who calls this?
-python atlas/bin/atlas_cli.py query callees <symbol>      # What does this call?
+python atlas/bin/atlas.py query calls <file>          # Probable calls from file
+python atlas/bin/atlas.py query callers <symbol>      # Who calls this?
+python atlas/bin/atlas.py query callees <symbol>      # What does this call?
 ```
 
 ### Impact Analysis
 ```bash
-python atlas/bin/atlas_cli.py query impact <symbol>       # Impact of changing symbol
-python atlas/bin/atlas_cli.py query impact-file <file>    # Impact of changing file
+python atlas/bin/atlas.py query impact <symbol>       # Impact of changing symbol
+python atlas/bin/atlas.py query impact-file <file>    # Impact of changing file
 ```
 
 ### Code Quality
 ```bash
-python atlas/bin/atlas_cli.py query todo [term]           # Find TODO/FIXME
-python atlas/bin/atlas_cli.py query security [term]       # Security-sensitive patterns
-python atlas/bin/atlas_cli.py query hotspots              # Complex files
+python atlas/bin/atlas.py query todo [term]           # Find TODO/FIXME
+python atlas/bin/atlas.py query security [term]       # Security-sensitive patterns
+python atlas/bin/atlas.py query hotspots              # Complex files
 ```
 
 ### Change Tracking
 ```bash
-python atlas/bin/atlas_cli.py translog                    # Initialize snapshot
-python atlas/bin/atlas_cli.py translog --poll             # Check for changes
-python atlas/bin/atlas_cli.py translog-report <file>      # File change history
+python atlas/bin/atlas.py translog                    # Initialize snapshot
+python atlas/bin/atlas.py translog --poll             # Check for changes
+python atlas/bin/atlas.py translog-report <file>      # File change history
 ```
 
 ---
@@ -2127,31 +2634,31 @@ python atlas/bin/atlas_cli.py translog-report <file>      # File change history
 
 1. **Locate the area:**
    ```bash
-   python atlas/bin/atlas_cli.py query search <keyword>
-   python atlas/bin/atlas_cli.py query structure <path>
+   python atlas/bin/atlas.py query search <keyword>
+   python atlas/bin/atlas.py query structure <path>
    ```
 
 2. **Find specific symbols:**
    ```bash
-   python atlas/bin/atlas_cli.py query class <ClassName>
-   python atlas/bin/atlas_cli.py query func <FunctionName>
+   python atlas/bin/atlas.py query class <ClassName>
+   python atlas/bin/atlas.py query func <FunctionName>
    ```
 
 3. **Check dependencies:**
    ```bash
-   python atlas/bin/atlas_cli.py query imports <file>
-   python atlas/bin/atlas_cli.py query importers <file>
+   python atlas/bin/atlas.py query imports <file>
+   python atlas/bin/atlas.py query importers <file>
    ```
 
 4. **Analyze impact:**
    ```bash
-   python atlas/bin/atlas_cli.py query impact-file <file>
-   python atlas/bin/atlas_cli.py query callers <symbol>
+   python atlas/bin/atlas.py query impact-file <file>
+   python atlas/bin/atlas.py query callers <symbol>
    ```
 
 5. **Check recent changes:**
    ```bash
-   python atlas/bin/atlas_cli.py translog-report <file>
+   python atlas/bin/atlas.py translog-report <file>
    ```
 
 6. **Open only necessary source files** and make changes.
@@ -2240,13 +2747,17 @@ project_root/
 # MAIN DEPLOYMENT LOGIC
 # =============================================================================
 
-def deploy_atlas(project_root: str, force: bool = False, verbose: bool = False, skip_callgraph: bool = False) -> None:
+def deploy_atlas(project_root: str, force: bool = False, verbose: bool = False, skip_callgraph: bool = False, python_path: str = None) -> None:
     """Deploy Atlas to a project root."""
     project_root = os.path.abspath(project_root)
     
     if not os.path.isdir(project_root):
         print(f"Error: Project root does not exist: {project_root}", file=sys.stderr)
         sys.exit(1)
+    
+    # Use provided python path or detect current interpreter
+    if not python_path:
+        python_path = sys.executable
     
     atlas_root = os.path.join(project_root, "atlas")
     
@@ -2262,6 +2773,7 @@ def deploy_atlas(project_root: str, force: bool = False, verbose: bool = False, 
         shutil.rmtree(atlas_root)
     
     print_section("Creating Atlas Directory Structure")
+    print_kv("Python path", python_path)
     
     # Create directories
     bin_dir = os.path.join(atlas_root, "bin")
@@ -2276,16 +2788,24 @@ def deploy_atlas(project_root: str, force: bool = False, verbose: bool = False, 
     
     print_section("Writing Tool Scripts")
     
+    # Build shebang line
+    shebang = f"#!{python_path}"
+    
     # Write tool scripts
     tools = {
         "tool_common.py": TOOL_COMMON_PY,
         "query.py": QUERY_PY,
         "translog.py": TRANSLOG_PY,
         "query_translog.py": QUERY_TRANSLOG_PY,
+        "rebuild.py": REBUILD_PY,
         "atlas_cli.py": ATLAS_CLI_PY,
     }
     
     for name, content in tools.items():
+        # Replace the generic shebang with the configured python path
+        if content.startswith("#!/usr/bin/env python3"):
+            content = content.replace("#!/usr/bin/env python3", shebang, 1)
+        
         path = os.path.join(bin_dir, name)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -2309,6 +2829,7 @@ def deploy_atlas(project_root: str, force: bool = False, verbose: bool = False, 
         "extensions": DEFAULT_EXTENSIONS,
         "skip_dirs": DEFAULT_SKIP_DIRS,
         "skip_globs": DEFAULT_SKIP_GLOBS,
+        "python_path": python_path,
     }
     
     # Build the index
@@ -2316,18 +2837,57 @@ def deploy_atlas(project_root: str, force: bool = False, verbose: bool = False, 
     summary = builder.build(verbose=verbose, skip_callgraph=skip_callgraph)
     
     # Write index state
-    state_fields = ["project_root", "atlas_root", "indexed_at", "version"]
+    state_fields = ["project_root", "atlas_root", "indexed_at", "version", "python_path"]
     state_rows = [{
         "project_root": project_root,
         "atlas_root": atlas_root,
         "indexed_at": utc_now(),
         "version": "1.0.0",
+        "python_path": python_path,
     }]
     write_toon_file(
         os.path.join(atlas_root, "index_state.toon"),
         "index_state", 1, state_fields, state_rows,
         ["# Atlas index state"]
     )
+    
+    # Create Python wrapper script in atlas/bin
+    wrapper_content = f'''#!{python_path}
+"""Atlas CLI wrapper - delegates to atlas_cli.py in the same directory."""
+import os
+import subprocess
+import sys
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cli_path = os.path.join(script_dir, "atlas_cli.py")
+    python_path = r"{python_path}"
+    
+    if not os.path.exists(cli_path):
+        print(f"Error: Atlas CLI not found at {{cli_path}}", file=sys.stderr)
+        sys.exit(1)
+    
+    cmd = [python_path, cli_path] + sys.argv[1:]
+    sys.exit(subprocess.call(cmd))
+
+if __name__ == "__main__":
+    main()
+'''
+    wrapper_path = os.path.join(bin_dir, "atlas.py")
+    with open(wrapper_path, "w", encoding="utf-8") as fh:
+        fh.write(wrapper_content)
+    if os.name != "nt":
+        os.chmod(wrapper_path, os.stat(wrapper_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    print_kv("Wrote", "atlas.py")
+    
+    # Create Windows batch file in atlas/bin
+    bat_content = f'''@echo off
+"{python_path}" "%~dp0atlas_cli.py" %*
+'''
+    bat_path = os.path.join(bin_dir, "atlas.bat")
+    with open(bat_path, "w", encoding="utf-8") as fh:
+        fh.write(bat_content)
+    print_kv("Wrote", "atlas.bat")
     
     print_section("Initializing Translog")
     
@@ -2358,6 +2918,7 @@ def deploy_atlas(project_root: str, force: bool = False, verbose: bool = False, 
     
     print(f"""
 Atlas has been deployed to: {atlas_root}
+Python interpreter: {python_path}
 
 Summary:
   Files indexed:     {summary['files']}
@@ -2368,13 +2929,22 @@ Summary:
   Security hints:    {summary['security_hints']}
 
 Quick start:
-  python {os.path.join(atlas_root, 'bin', 'atlas_cli.py')} query summary
-  python {os.path.join(atlas_root, 'bin', 'atlas_cli.py')} query search <term>
-  python {os.path.join(atlas_root, 'bin', 'atlas_cli.py')} help
+  cd {bin_dir}
+  atlas query summary                  # Windows (using atlas.bat)
+  python atlas.py query summary        # Cross-platform
+  python atlas.py rebuild --skip-callgraph
+  python atlas.py help
+
+Or add {bin_dir} to your PATH for global access.
 
 LLM Instructions:
   {os.path.join(instructions_dir, 'llm.md')}
 """)
+
+
+def get_python_path() -> str:
+    """Get the path to the current Python interpreter."""
+    return sys.executable
 
 
 def main():
@@ -2385,8 +2955,8 @@ def main():
 Examples:
   python deploy_atlas.py /path/to/myproject
   python deploy_atlas.py /path/to/myproject --yes
-  python deploy_atlas.py /path/to/myproject --skip-callgraph  # Faster for large codebases
-  python deploy_atlas.py . --verbose
+  python deploy_atlas.py /path/to/myproject --skip-callgraph
+  python deploy_atlas.py /path/to/myproject --python-path "C:\\Python312\\python.exe"
         """
     )
     parser.add_argument("project_root", help="Path to the project root directory")
@@ -2394,11 +2964,16 @@ Examples:
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--skip-callgraph", action="store_true", 
                         help="Skip call graph analysis (faster for large codebases)")
+    parser.add_argument("--python-path", 
+                        help="Path to Python interpreter (auto-detected if not specified)")
     
     args = parser.parse_args()
     
+    # Determine Python path
+    python_path = args.python_path or get_python_path()
+    
     deploy_atlas(args.project_root, force=args.yes, verbose=args.verbose, 
-                 skip_callgraph=args.skip_callgraph)
+                 skip_callgraph=args.skip_callgraph, python_path=python_path)
 
 
 if __name__ == "__main__":
