@@ -1,7 +1,5 @@
 # Atlas
 
-**Offline codebase index generator for LLM coding assistants.**
-
 Atlas extracts file structure, symbols, imports, call graphs, and architecture into a compact queryable format. It reduces token overhead by letting AI agents query the index first, then open only the files they need.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -45,7 +43,7 @@ The AI queries the index first, then opens only the 2-3 files it actually needs.
 
 ```bash
 # Download the deployment script
-curl -O https://raw.githubusercontent.com/prynix/atlas/deploy_atlas.py
+curl -O https://raw.githubusercontent.com/YOUR_USERNAME/atlas/main/deploy_atlas.py
 
 # Deploy to your project
 python deploy_atlas.py /path/to/your/project --yes
@@ -54,19 +52,19 @@ python deploy_atlas.py /path/to/your/project --yes
 ### 2. Query the index
 
 ```bash
-cd /path/to/your/project
+cd /path/to/your/project/atlas/bin
 
 # Get an overview
-python atlas/bin/atlas_cli.py query summary
+python atlas.py query summary
 
 # Search for code
-python atlas/bin/atlas_cli.py query search "database"
+python atlas.py query search "database"
 
 # Find a class
-python atlas/bin/atlas_cli.py query class UserService
+python atlas.py query class UserService
 
 # Check what imports a file
-python atlas/bin/atlas_cli.py query importers "config.py"
+python atlas.py query importers "config.py"
 ```
 
 ### 3. Give instructions to your AI assistant
@@ -85,16 +83,35 @@ Copy the contents of `atlas/instructions/llm.md` into your AI coding assistant's
 ### Method 1: Direct download
 
 ```bash
-curl -O https://raw.githubusercontent.com/prynix/atlas/deploy_atlas.py
+curl -O https://raw.githubusercontent.com/YOUR_USERNAME/atlas/main/deploy_atlas.py
 python deploy_atlas.py /path/to/project
 ```
 
 ### Method 2: Clone repository
 
 ```bash
-git clone https://github.com/prynix/atlas.git
+git clone https://github.com/YOUR_USERNAME/atlas.git
 python atlas/deploy_atlas.py /path/to/project
 ```
+
+### Deployment Options
+
+```bash
+python deploy_atlas.py /path/to/project                    # Interactive mode
+python deploy_atlas.py /path/to/project --yes              # Skip confirmation
+python deploy_atlas.py /path/to/project --verbose          # Verbose output
+python deploy_atlas.py /path/to/project --skip-callgraph   # Skip call graph (faster)
+python deploy_atlas.py /path/to/project --python-path "C:\Python312\python.exe"
+```
+
+| Option | Description |
+|--------|-------------|
+| `--yes`, `-y` | Skip confirmation prompts |
+| `--verbose`, `-v` | Show detailed progress |
+| `--skip-callgraph` | Skip call graph analysis (much faster for large codebases) |
+| `--python-path` | Specify Python interpreter path (auto-detected if not provided) |
+
+**For large codebases** (10,000+ files), use `--skip-callgraph` to speed up deployment significantly.
 
 ---
 
@@ -106,8 +123,11 @@ After deployment, Atlas creates this structure in your project:
 your_project/
 └── atlas/
     ├── bin/                        # CLI tools
+    │   ├── atlas.bat               # Windows wrapper
+    │   ├── atlas.py                # Python wrapper (cross-platform)
     │   ├── atlas_cli.py            # Main command router
     │   ├── query.py                # Index query engine
+    │   ├── rebuild.py              # Index rebuilder
     │   ├── translog.py             # Change tracking
     │   ├── query_translog.py       # Translog reports
     │   └── tool_common.py          # Shared utilities
@@ -144,21 +164,42 @@ your_project/
 
 ---
 
-## Command Reference
+## Usage
 
-### Basic Usage
+### Running Atlas
 
+**Option 1: From the bin directory**
 ```bash
-# All commands start with:
-python atlas/bin/atlas_cli.py <command> [subcommand] [args...]
+cd /path/to/project/atlas/bin
 
-# Or use the shorthand (if you add atlas/bin to PATH):
-atlas <command> [subcommand] [args...]
+# Windows (using batch file)
+atlas query summary
+atlas rebuild --skip-callgraph
+
+# Cross-platform (using Python)
+python atlas.py query summary
+python atlas.py rebuild --skip-callgraph
 ```
 
-### Query Commands
+**Option 2: From the project root**
+```bash
+cd /path/to/project
+python atlas/bin/atlas.py query summary
+python atlas/bin/atlas.py rebuild --skip-callgraph
+```
 
-#### Summary & Diagnostics
+**Option 3: Add to PATH (recommended)**
+```bash
+# Add atlas/bin to your PATH, then run from anywhere:
+atlas query summary
+atlas rebuild
+```
+
+---
+
+## Command Reference
+
+### Summary & Diagnostics
 
 ```bash
 atlas query summary              # Index overview (files, classes, functions)
@@ -166,7 +207,7 @@ atlas query capabilities         # List all available commands
 atlas query doctor               # Check index health
 ```
 
-#### Searching
+### Searching
 
 ```bash
 atlas query search <term>                    # Search files, classes, functions
@@ -175,16 +216,16 @@ atlas query search <term> --path src/core    # Filter by path
 atlas query structure <path>                 # List directory contents
 ```
 
-#### Symbol Lookup
+### Symbol Lookup
 
 ```bash
 atlas query class <ClassName>       # Find class definitions
 atlas query func <FunctionName>     # Find function definitions
-atlas query symbol <name>           # Find any symbol (class or function)
-atlas query constants <NAME>        # Find constant definitions
+atlas query symbol <Name>           # Find any symbol (class or function)
+atlas query constants <Name>        # Find constant definitions
 ```
 
-#### Dependency Analysis
+### Dependency Analysis
 
 ```bash
 atlas query imports <file>          # What does this file import?
@@ -192,7 +233,7 @@ atlas query importers <target>      # What files import this target?
 atlas query related <file>          # Both directions (imports + importers)
 ```
 
-#### Call Graph (Heuristic)
+### Call Graph (Heuristic)
 
 ```bash
 atlas query calls <file>            # What functions does this file call?
@@ -200,14 +241,14 @@ atlas query callers <symbol>        # What files call this function?
 atlas query callees <symbol>        # What does this function call?
 ```
 
-#### Impact Analysis
+### Impact Analysis
 
 ```bash
 atlas query impact <symbol>         # Who would be affected by changing this?
 atlas query impact-file <file>      # Who depends on this file?
 ```
 
-#### Code Quality
+### Code Quality
 
 ```bash
 atlas query todo                    # List all TODO/FIXME markers
@@ -226,12 +267,47 @@ atlas translog --poll               # Check for changes since last snapshot
 atlas translog-report <file>        # Show change history for a file
 ```
 
+### Rebuild Commands
+
+```bash
+atlas rebuild                       # Full rebuild with call graph
+atlas rebuild --skip-callgraph      # Fast rebuild without call graph
+atlas rebuild --update-translog     # Also refresh translog baselines
+```
+
 ### Output Formats
 
 ```bash
 atlas query summary --json          # Output as JSON
 atlas query search foo --json       # Structured output for parsing
 ```
+
+---
+
+## Rebuilding the Index
+
+After making code changes, rebuild the index to capture new symbols:
+
+```bash
+cd /path/to/project/atlas/bin
+
+# Quick rebuild (recommended for most cases)
+atlas rebuild --skip-callgraph
+
+# Full rebuild with call graph analysis
+atlas rebuild
+
+# Rebuild and refresh translog baselines
+atlas rebuild --update-translog
+```
+
+**When to rebuild:**
+- After adding new files or classes
+- After significant refactoring
+- When query results seem stale
+- Before starting a new coding session
+
+Rebuild is much faster than re-running deployment — it only regenerates index data, not tool scripts.
 
 ---
 
@@ -322,9 +398,9 @@ Add to your project's `CLAUDE.md` or system instructions:
 
 This project uses Atlas for codebase indexing. Before reading source files:
 
-1. Run `python atlas/bin/atlas_cli.py query summary` to orient yourself
-2. Use `atlas query search <term>` to find relevant code
-3. Use `atlas query impact-file <file>` before making changes
+1. Run `python atlas/bin/atlas.py query summary` to orient yourself
+2. Use `python atlas/bin/atlas.py query search <term>` to find relevant code
+3. Use `python atlas/bin/atlas.py query impact-file <file>` before making changes
 4. Only then open the specific source files you need
 
 See `atlas/instructions/llm.md` for complete guidance.
@@ -337,11 +413,11 @@ Add to your custom instructions or system prompt:
 ```
 You have access to an Atlas codebase index. Always query the index before reading source files:
 
-- atlas query summary: Get project overview
-- atlas query search <term>: Find code
-- atlas query class/func <name>: Locate definitions
-- atlas query imports/importers <file>: Check dependencies
-- atlas query impact-file <file>: Assess change impact
+- python atlas/bin/atlas.py query summary: Get project overview
+- python atlas/bin/atlas.py query search <term>: Find code
+- python atlas/bin/atlas.py query class/func <Name>: Locate definitions
+- python atlas/bin/atlas.py query imports/importers <file>: Check dependencies
+- python atlas/bin/atlas.py query impact-file <file>: Assess change impact
 
 Query first, then open only necessary files.
 ```
@@ -424,10 +500,11 @@ Recent Changes
 
 ### For Humans
 
-1. **Re-deploy after major changes**: `python deploy_atlas.py /project --yes`
+1. **Rebuild after code changes**: `atlas rebuild --skip-callgraph`
 2. **Poll translog regularly**: `atlas translog --poll`
 3. **Use `--json` for scripting**: Parse output programmatically
-4. **Add `atlas/` to `.gitignore`** if you don't want to commit the index
+4. **Add `atlas/bin` to PATH** for easier command access
+5. **Add `atlas/` to `.gitignore`** if you don't want to commit the index
 
 ---
 
@@ -437,7 +514,7 @@ Recent Changes
 |------------|---------|
 | **Regex-based extraction** | Symbol detection uses regex patterns, not compiler/parser analysis. May miss complex cases. |
 | **Heuristic call graph** | Function calls are detected by name matching, not semantic analysis. May have false positives. |
-| **No incremental updates** | Re-running deployment rebuilds the entire index. |
+| **No incremental updates** | Rebuild regenerates the entire index (but is still fast). |
 | **Language-agnostic patterns** | Some language-specific constructs may not be detected. |
 
 ### When Atlas says "heuristic"
@@ -451,11 +528,21 @@ Results marked as heuristic should be verified:
 
 ## Troubleshooting
 
+### Deployment hangs at "Building Call Graph"
+
+This happens on large codebases with many functions. Use `--skip-callgraph`:
+
+```bash
+python deploy_atlas.py /path/to/project --yes --skip-callgraph
+```
+
+The call graph is optional — all other features (search, symbols, imports, TODOs) work without it.
+
 ### "Unable to locate Atlas index"
 
 ```bash
 # Specify the atlas directory explicitly
-python atlas/bin/atlas_cli.py query summary --atlas /path/to/project/atlas
+python atlas.py query summary --atlas /path/to/project/atlas
 ```
 
 ### Empty search results
@@ -471,9 +558,10 @@ python atlas/bin/atlas_cli.py query summary --atlas /path/to/project/atlas
 
 ### Stale data
 
-Re-run deployment to rebuild:
+Rebuild the index:
 ```bash
-python deploy_atlas.py /path/to/project --yes
+cd /path/to/project/atlas/bin
+atlas rebuild --skip-callgraph
 ```
 
 ### Index appears corrupted
@@ -482,10 +570,34 @@ python deploy_atlas.py /path/to/project --yes
 # Check index health
 atlas query doctor
 
-# If issues found, rebuild
+# If issues found, re-deploy
 rm -rf atlas/
 python deploy_atlas.py /path/to/project --yes
 ```
+
+---
+
+## Windows-Specific Notes
+
+### Using the Batch File
+
+On Windows, you can use `atlas.bat` for simpler commands:
+
+```batch
+cd C:\path\to\project\atlas\bin
+atlas query summary
+atlas rebuild --skip-callgraph
+```
+
+### Custom Python Path
+
+If Python isn't in your PATH, specify it during deployment:
+
+```bash
+python deploy_atlas.py C:\path\to\project --python-path "C:\Users\YourName\AppData\Local\Programs\Python\Python312\python.exe"
+```
+
+This embeds the full Python path in all generated scripts.
 
 ---
 
@@ -501,14 +613,15 @@ Contributions are welcome! Areas of interest:
 ### Development setup
 
 ```bash
-git clone https://github.com/prynix/atlas.git
+git clone https://github.com/YOUR_USERNAME/atlas.git
 cd atlas
 
 # Test deployment
 python deploy_atlas.py ./test_project --yes
 
 # Run queries
-python test_project/atlas/bin/atlas_cli.py query summary
+cd test_project/atlas/bin
+python atlas.py query summary
 ```
 
 ---
@@ -533,5 +646,8 @@ Inspired by the need for better AI-assisted code navigation. Built for use with 
 - Single-file deployment script
 - Query engine with 20+ commands
 - Translog change tracking
+- Rebuild command for index refresh
 - LLM instruction templates
 - Support for 30+ file extensions
+- Windows batch file support
+- Configurable Python interpreter path
