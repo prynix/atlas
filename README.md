@@ -45,7 +45,7 @@ The AI queries the index first, then opens only the 2-3 files it actually needs.
 
 ```bash
 # Download the deployment script
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/atlas/main/deploy_atlas.py
+curl -O https://raw.githubusercontent.com/prynix/atlas/deploy_atlas.py
 
 # Deploy to your project
 python deploy_atlas.py /path/to/your/project --yes
@@ -85,14 +85,14 @@ Copy the contents of `atlas/instructions/llm.md` into your AI coding assistant's
 ### Method 1: Direct download
 
 ```bash
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/atlas/main/deploy_atlas.py
+curl -O https://raw.githubusercontent.com/prynix/atlas/deploy_atlas.py
 python deploy_atlas.py /path/to/project
 ```
 
 ### Method 2: Clone repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/atlas.git
+git clone https://github.com/prynix/atlas.git
 python atlas/deploy_atlas.py /path/to/project
 ```
 
@@ -501,7 +501,7 @@ Contributions are welcome! Areas of interest:
 ### Development setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/atlas.git
+git clone https://github.com/prynix/atlas.git
 cd atlas
 
 # Test deployment
